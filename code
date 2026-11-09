@@ -1,0 +1,174 @@
+/*
+  ESP32 Soil Moisture Monitor with Telegram Bot
+
+  Features:
+   - /start     : shows the command list
+   - /moisture  : replies with the current soil moisture (% and raw value)
+   - /status    : replies with Wi-Fi signal and uptime too
+   - Automatic alert when soil becomes dry (and again when it recovers)
+
+  Wiring (capacitive soil moisture sensor v1.2):
+   - VCC  -> 3V3
+   - GND  -> GND
+   - AOUT -> GPIO34 (ADC1, works while Wi-Fi is on)
+
+  Libraries (Library Manager):
+   - UniversalTelegramBot by Brian Lough
+   - ArduinoJson by Benoit Blanchon  (use version 6.21.x)
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+
+// ---------- USER SETTINGS ----------
+const char* WIFI_SSID     = "Shoaib";
+const char* WIFI_PASSWORD = "123456789";
+const char* BOT_TOKEN     = "8648257796:AAE6Rr803dHGswdF6lEa9WK6cRMD3vfmSbE";   // from @BotFather
+const char* CHAT_ID       = "5538795716";               // from @myidbot
+
+#define SOIL_PIN 34
+
+// Calibrate these two values for YOUR sensor (see steps):
+int DRY_VALUE = 3200;   // raw reading with the sensor in open air (dry)
+int WET_VALUE = 1400;   // raw reading with the sensor in a glass of water
+
+int DRY_ALERT_PERCENT = 30;   // alert when moisture falls below this
+int OK_PERCENT        = 40;   // "recovered" message when moisture rises above this
+
+const unsigned long BOT_POLL_INTERVAL   = 1000;              // check Telegram every 1 s
+const unsigned long SENSOR_CHECK_INTERVAL = 10000;           // read sensor every 10 s
+const unsigned long ALERT_COOLDOWN      = 30UL * 60UL * 1000UL; // repeat dry alert every 30 min
+// -----------------------------------
+
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+
+unsigned long lastBotPoll = 0;
+unsigned long lastSensorCheck = 0;
+unsigned long lastAlertTime = 0;
+bool isDry = false;
+
+// Average 20 samples to reduce noise
+int readRaw() {
+  long sum = 0;
+  for (int i = 0; i < 20; i++) {
+    sum += analogRead(SOIL_PIN);
+    delay(5);
+  }
+  return sum / 20;
+}
+
+int rawToPercent(int raw) {
+  int pct = map(raw, DRY_VALUE, WET_VALUE, 0, 100);
+  return constrain(pct, 0, 100);
+}
+
+String moistureLabel(int pct) {
+  if (pct < DRY_ALERT_PERCENT) return "Dry";
+  if (pct < 60) return "Moist (good)";
+  return "Wet";
+}
+
+String buildMoistureMessage() {
+  int raw = readRaw();
+  int pct = rawToPercent(raw);
+  String msg = "Soil moisture: " + String(pct) + "%\n";
+  msg += "Condition: " + moistureLabel(pct) + "\n";
+  msg += "Raw ADC value: " + String(raw);
+  return msg;
+}
+
+void handleMessages(int numNew) {
+  for (int i = 0; i < numNew; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    String text    = bot.messages[i].text;
+
+    // Only respond to the owner
+    if (chat_id != CHAT_ID) {
+      bot.sendMessage(chat_id, "Unauthorized user.", "");
+      continue;
+    }
+
+    if (text == "/start") {
+      String welcome = "Soil Moisture Bot\n\n";
+      welcome += "/moisture - current soil moisture\n";
+      welcome += "/status - moisture, Wi-Fi and uptime\n";
+      bot.sendMessage(chat_id, welcome, "");
+    } else if (text == "/moisture") {
+      bot.sendMessage(chat_id, buildMoistureMessage(), "");
+    } else if (text == "/status") {
+      String msg = buildMoistureMessage();
+      msg += "\nWi-Fi signal: " + String(WiFi.RSSI()) + " dBm";
+      msg += "\nUptime: " + String(millis() / 60000) + " min";
+      bot.sendMessage(chat_id, msg, "");
+    } else {
+      bot.sendMessage(chat_id, "Unknown command. Send /start to see options.", "");
+    }
+  }
+}
+
+void checkSoilAndAlert() {
+  int raw = readRaw();
+  int pct = rawToPercent(raw);
+  Serial.printf("Raw: %d  Moisture: %d%%\n", raw, pct);
+
+  if (pct < DRY_ALERT_PERCENT) {
+    // Send first alert immediately, then repeat after the cooldown
+    if (!isDry || (millis() - lastAlertTime > ALERT_COOLDOWN)) {
+      bot.sendMessage(CHAT_ID,
+        "ALERT: Soil is dry! Moisture is " + String(pct) + "%. Please water the plant.", "");
+      lastAlertTime = millis();
+    }
+    isDry = true;
+  } else if (isDry && pct > OK_PERCENT) {
+    bot.sendMessage(CHAT_ID,
+      "Soil moisture recovered to " + String(pct) + "%. Thank you!", "");
+    isDry = false;
+  }
+}
+
+void connectWiFi() {
+  Serial.printf("Connecting to %s", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi connected. IP: " + WiFi.localIP().toString());
+}
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);                 // 0 - 4095
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
+
+  connectWiFi();
+  secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);  // Telegram SSL certificate
+
+  bot.sendMessage(CHAT_ID, "Soil moisture monitor is online. Send /moisture to check.", "");
+}
+
+void loop() {
+  // Reconnect if Wi-Fi drops
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  // Check for new Telegram commands
+  if (millis() - lastBotPoll > BOT_POLL_INTERVAL) {
+    int numNew = bot.getUpdates(bot.last_message_received + 1);
+    while (numNew) {
+      handleMessages(numNew);
+      numNew = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastBotPoll = millis();
+  }
+
+  // Check soil moisture periodically
+  if (millis() - lastSensorCheck > SENSOR_CHECK_INTERVAL) {
+    checkSoilAndAlert();
+    lastSensorCheck = millis();
+  }
+}
